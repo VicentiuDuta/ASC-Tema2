@@ -4,7 +4,6 @@
 #include <string.h>
 #include <stdlib.h>
 #include <cuda_runtime.h>
-
 // CUDA sprintf alternative for nonce finding. Converts integer to its string representation. Returns string's length.
 __device__ int intToString(uint64_t num, char* out) {
     if (num == 0) {
@@ -93,56 +92,55 @@ __host__ __device__ int compare_hashes(BYTE* hash1, BYTE* hash2) {
 // TODO 1: Implement this function in CUDA
 void construct_merkle_root(int transaction_size, BYTE *transactions, int max_transactions_in_a_block, int n, BYTE merkle_root[SHA256_HASH_SIZE]) {
     BYTE (*hashes)[SHA256_HASH_SIZE] = (BYTE (*)[SHA256_HASH_SIZE])malloc(max_transactions_in_a_block * SHA256_HASH_SIZE);
-    if (!hashes) {
-        fprintf(stderr, "Error: Unable to allocate memory for hashes\n");
-        exit(EXIT_FAILURE);
+    // Allocate device memory for transactions
+    BYTE *device_transactions;
+    cudaMalloc((void **) &device_transactions, n * transaction_size);
+
+    // Allocate device memory for hashes
+    BYTE *device_hashes;
+    cudaMalloc((void **) &device_hashes, n * SHA256_HASH_SIZE);
+
+    // Copy transactions to device
+    cudaMemcpy(device_transactions, transactions, n * transaction_size, cudaMemcpyHostToDevice);
+
+
+    // Declare kernel parameters
+    const size_t block_size = 256;
+    size_t num_blocks = n / block_size;
+    if (n % block_size != 0) {
+        num_blocks++;
     }
 
-    // Compute the SHA256 hash for each transaction
-    for (int i = 0; i < n; i++) {
-        apply_sha256(transactions + i * transaction_size, hashes[i]);
-    }
+    // Launch kernel to compute transaction hashes
+    compute_transaction_hashes_kernel<<<num_blocks, block_size>>>(device_transactions, device_hashes, transaction_size, n);
+    // Wait for kernel to finish
+    cudaDeviceSynchronize();
 
-    // Build the Merkle tree
-    while (n > 1) {
-        int new_n = 0;
-        for (int i = 0; i < n; i += 2) {
-            BYTE combined[SHA256_HASH_SIZE * 2];
-            if (i + 1 < n) {
-                strcpy((char *)combined, (const char *)hashes[i]);
-                strcat((char *)combined, (const char *)hashes[i+1]);
-            } else {
-                // If odd number of hashes, duplicate the last one
-                strcpy((char *)combined, (const char *)hashes[i]);
-                strcat((char *)combined, (const char *)hashes[i]);
-            }
-            apply_sha256(combined, hashes[new_n++]);
-        }
-        n = new_n;
-    }
+    // Free device memory
+    cudaFree(device_transactions);
+    
+    // Allocate device memory for merkle root
+    BYTE *device_merkle_root;
+    cudaMalloc((void **) &device_merkle_root, SHA256_HASH_SIZE);
 
-    memcpy(merkle_root, hashes[0], SHA256_HASH_SIZE);
-
-    free(hashes);
 }
 
 // TODO 2: Implement this function in CUDA
 int find_nonce(BYTE *difficulty, uint32_t max_nonce, BYTE *block_content, size_t current_length, BYTE *block_hash, uint32_t *valid_nonce) {
-    char nonce_string[NONCE_SIZE];
-
-    for (uint32_t nonce = 0; nonce <= max_nonce; nonce++) {
-        sprintf(nonce_string, "%u", nonce);
-        strcpy((char *)block_content + current_length, nonce_string);
-        apply_sha256(block_content, block_hash);
-
-        if (compare_hashes(block_hash, difficulty) <= 0) {
-            *valid_nonce = nonce;
-            return 0;
-        }
-    }
-
-    return 1;
+    
 }
+
+__global__ void compute_transaction_hashes_kernel(BYTE *transactions, BYTE *hashes, int transaction_size, int n) {
+    unsigned int idx = threadIdx.x + blockDim.x * blockIdx.x;
+    if (idx < n) [
+        apply_sha256(transactions + idx * transaction_size, hashes[idx]);
+    ]
+}
+
+__global__ void construct_merkle_root_kernel(BYTE *hashes, int n, BYTE *merkle_root) {
+    unsigned int idx = threadIdx.x + blockDim.x * blockIdx.x;
+    
+} 
 
 __global__ void dummy_kernel() {}
 

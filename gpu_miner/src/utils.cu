@@ -196,38 +196,109 @@ void construct_merkle_root(int transaction_size, BYTE *transactions, int max_tra
 
 }
 
-void find_nonce_kernel(BYTE *difficulty, uint32_t max_nonce, BYTE *block_content, size_t current_length, BYTE *block_hash, uint32_t *valid_nonce, uint32_t *found_nonce_flag) {
-
+__global__ void find_nonce_kernel(BYTE *difficulty, uint32_t max_nonce, BYTE *block_content, 
+                                 size_t current_length, BYTE *global_block_hash, 
+                                 uint32_t *valid_nonce, uint32_t *found_nonce_flag) {
+    unsigned int tid = threadIdx.x;
+    unsigned int stride = blockDim.x;
+    
+    // Calculate nonce range for this block
+    uint32_t nonce_per_block = (max_nonce + gridDim.x - 1) / gridDim.x;
+    uint32_t nonce_start = nonce_per_block * blockIdx.x;
+    uint32_t nonce_end = min(nonce_start + nonce_per_block, max_nonce);
+    
+    // Create local buffers for thread-safe operations
+    char nonce_str[NONCE_SIZE];
+    BYTE local_block[BLOCK_SIZE];
+    BYTE local_hash[SHA256_HASH_SIZE];
+    
+    // Copy the block content to local memory (without the nonce)
+    for (int i = 0; i < current_length; i++) {
+        local_block[i] = block_content[i];
+    }
+    local_block[current_length] = '\0';
+    
+    // Iterate over nonces assigned to this thread
+    for (uint32_t nonce = nonce_start + tid; nonce < nonce_end && !(*found_nonce_flag); nonce += stride) {
+        // Add nonce to block content
+        int nonce_len = intToString(nonce, nonce_str);
+        d_strcpy((char *)(local_block + current_length), nonce_str);
+        
+        // Compute hash
+        apply_sha256(local_block, local_hash);
+        
+        // Check if hash meets difficulty requirement
+        if (compare_hashes(local_hash, difficulty) <= 0) {
+            // Found valid nonce - use atomic operation to ensure only one thread succeeds
+            if (atomicExch(found_nonce_flag, 1) == 0) {
+                *valid_nonce = nonce;
+                
+                // Copy hash to output location
+                for (int i = 0; i < SHA256_HASH_SIZE; i++) {
+                    global_block_hash[i] = local_hash[i];
+                }
+            }
+            break;
+        }
+    }
 }
 
-// TODO 2: Implement this function in CUDA
 int find_nonce(BYTE *difficulty, uint32_t max_nonce, BYTE *block_content, size_t current_length, BYTE *block_hash, uint32_t *valid_nonce) {
-    // Allocate device memory for block content
+    // Allocate device memory
     BYTE *device_difficulty;
-    cudaMalloc((void **) &device_difficulty, SHA256_HASH_SIZE);
-    cudaMemcpy(device_difficulty, difficulty, SHA256_HASH_SIZE, cudaMemcpyHostToDevice);
-
     BYTE *device_block_content;
-    cudaMalloc((void **) &device_block_content, current_length);
-    cudaMemcpy(device_block_content, block_content, current_length, cudaMemcpyHostToDevice);
-
     BYTE *device_block_hash;
-    cudaMalloc((void **) &device_block_hash, SHA256_HASH_SIZE);
-    cudaMemcpy(device_block_hash, block_hash, SHA256_HASH_SIZE, cudaMemcpyHostToDevice);
-
     uint32_t *device_valid_nonce;
-    cudaMalloc((void **) &device_valid_nonce, sizeof(uint32_t));
-
-    int* device_found_nonce;
-    cudaMalloc((void **) &device_found_nonce, sizeof(int));
-    cudaMemset(device_found_nonce, 0, sizeof(int));
-
-    // Declare kernel parameters
-    const size_t block_size = 512;
-    size_t num_blocks = max_nonce / block_size;
-    if (max_nonce % block_size != 0) {
-        num_blocks++;
+    uint32_t *device_found_flag;
+    
+    cudaMalloc((void **)&device_difficulty, SHA256_HASH_SIZE);
+    cudaMalloc((void **)&device_block_content, BLOCK_SIZE);
+    cudaMalloc((void **)&device_block_hash, SHA256_HASH_SIZE);
+    cudaMalloc((void **)&device_valid_nonce, sizeof(uint32_t));
+    cudaMalloc((void **)&device_found_flag, sizeof(uint32_t));
+    
+    // Copy data to device
+    cudaMemcpy(device_difficulty, difficulty, SHA256_HASH_SIZE, cudaMemcpyHostToDevice);
+    cudaMemcpy(device_block_content, block_content, current_length + 1, cudaMemcpyHostToDevice); // +1 for null terminator
+    cudaMemset(device_found_flag, 0, sizeof(uint32_t));
+    
+    // Configure kernel launch parameters
+    const size_t block_size = 256;
+    size_t num_blocks = min(1024, (max_nonce + block_size - 1) / block_size);
+    
+    // Launch kernel
+    find_nonce_kernel<<<num_blocks, block_size>>>(
+        device_difficulty, max_nonce, device_block_content, 
+        current_length, device_block_hash, device_valid_nonce, device_found_flag
+    );
+    
+    // Wait for kernel to finish
+    cudaDeviceSynchronize();
+    
+    // Check for CUDA errors
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        printf("CUDA Error: %s\n", cudaGetErrorString(err));
     }
+    
+    // Check if nonce was found
+    uint32_t found_flag = 0;
+    cudaMemcpy(&found_flag, device_found_flag, sizeof(uint32_t), cudaMemcpyDeviceToHost);
+    
+    if (found_flag) {
+        // Copy results back to host
+        cudaMemcpy(valid_nonce, device_valid_nonce, sizeof(uint32_t), cudaMemcpyDeviceToHost);
+        cudaMemcpy(block_hash, device_block_hash, SHA256_HASH_SIZE, cudaMemcpyDeviceToHost);
+    }
+    
+    // Free device memory
+    cudaFree(device_difficulty);
+    cudaFree(device_block_content);
+    cudaFree(device_block_hash);
+    cudaFree(device_valid_nonce);
+    cudaFree(device_found_flag);
+    
+    return found_flag ? 0 : 1;
 }
 
 

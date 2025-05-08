@@ -244,61 +244,20 @@ __global__ void find_nonce_kernel(BYTE *difficulty, uint32_t max_nonce, BYTE *bl
 }
 
 int find_nonce(BYTE *difficulty, uint32_t max_nonce, BYTE *block_content, size_t current_length, BYTE *block_hash, uint32_t *valid_nonce) {
-    // Allocate device memory
-    BYTE *device_difficulty;
-    BYTE *device_block_content;
-    BYTE *device_block_hash;
-    uint32_t *device_valid_nonce;
-    uint32_t *device_found_flag;
-    
-    cudaMalloc((void **)&device_difficulty, SHA256_HASH_SIZE);
-    cudaMalloc((void **)&device_block_content, BLOCK_SIZE);
-    cudaMalloc((void **)&device_block_hash, SHA256_HASH_SIZE);
-    cudaMalloc((void **)&device_valid_nonce, sizeof(uint32_t));
-    cudaMalloc((void **)&device_found_flag, sizeof(uint32_t));
-    
-    // Copy data to device
-    cudaMemcpy(device_difficulty, difficulty, SHA256_HASH_SIZE, cudaMemcpyHostToDevice);
-    cudaMemcpy(device_block_content, block_content, current_length + 1, cudaMemcpyHostToDevice); // +1 for null terminator
-    cudaMemset(device_found_flag, 0, sizeof(uint32_t));
-    
-    // Configure kernel launch parameters
-    const size_t block_size = 256;
-    size_t num_blocks = min(1024, (max_nonce + block_size - 1) / block_size);
-    
-    // Launch kernel
-    find_nonce_kernel<<<num_blocks, block_size>>>(
-        device_difficulty, max_nonce, device_block_content, 
-        current_length, device_block_hash, device_valid_nonce, device_found_flag
-    );
-    
-    // Wait for kernel to finish
-    cudaDeviceSynchronize();
-    
-    // Check for CUDA errors
-    cudaError_t err = cudaGetLastError();
-    if (err != cudaSuccess) {
-        printf("CUDA Error: %s\n", cudaGetErrorString(err));
+    char nonce_string[NONCE_SIZE];
+
+    for (uint32_t nonce = 0; nonce <= max_nonce; nonce++) {
+        sprintf(nonce_string, "%u", nonce);
+        strcpy((char *)block_content + current_length, nonce_string);
+        apply_sha256(block_content, block_hash);
+
+        if (compare_hashes(block_hash, difficulty) <= 0) {
+            *valid_nonce = nonce;
+            return 0;
+        }
     }
-    
-    // Check if nonce was found
-    uint32_t found_flag = 0;
-    cudaMemcpy(&found_flag, device_found_flag, sizeof(uint32_t), cudaMemcpyDeviceToHost);
-    
-    if (found_flag) {
-        // Copy results back to host
-        cudaMemcpy(valid_nonce, device_valid_nonce, sizeof(uint32_t), cudaMemcpyDeviceToHost);
-        cudaMemcpy(block_hash, device_block_hash, SHA256_HASH_SIZE, cudaMemcpyDeviceToHost);
-    }
-    
-    // Free device memory
-    cudaFree(device_difficulty);
-    cudaFree(device_block_content);
-    cudaFree(device_block_hash);
-    cudaFree(device_valid_nonce);
-    cudaFree(device_found_flag);
-    
-    return found_flag ? 0 : 1;
+
+    return 1;
 }
 
 

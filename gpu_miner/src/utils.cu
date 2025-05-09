@@ -100,25 +100,6 @@ __global__ void compute_transaction_hashes_kernel(BYTE *transactions, BYTE *hash
 
 // Kernel for constructing one level of the Merkle tree
 __global__ void construct_merkle_level_kernel(BYTE *hashes, BYTE *next_level_hashes, int n) {
-    // unsigned int idx = threadIdx.x + blockDim.x * blockIdx.x;
-    
-    // if (idx < (n + 1) / 2) {
-    //     BYTE combined[2 * SHA256_HASH_SIZE];
-        
-    //     // Copiază primul hash
-    //     d_strcpy((char*)combined, (const char*)(hashes + (idx * 2) * SHA256_HASH_SIZE));
-        
-    //     // Adaugă al doilea hash sau duplică primul
-    //     if (idx * 2 + 1 < n) {
-    //         d_strcat((char*)combined, (const char*)(hashes + (idx * 2 + 1) * SHA256_HASH_SIZE));
-    //     } else {
-    //         d_strcat((char*)combined, (const char*)(hashes + (idx * 2) * SHA256_HASH_SIZE));
-    //     }
-        
-    //     // Calculează hash-ul combinat
-    //     apply_sha256(combined, next_level_hashes + idx * SHA256_HASH_SIZE);
-    // }
-
     __shared__ BYTE shared_hashes[256 * SHA256_HASH_SIZE];
     unsigned int tid = threadIdx.x;
     unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -178,20 +159,9 @@ void construct_merkle_root(int transaction_size, BYTE *transactions, int max_tra
     }
     
     // Check for cudaMalloc success
-    cudaError_t err;
     BYTE *d_transactions;
     // Check if device has enough memory
-    size_t free_mem, total_mem;
-    cudaMemGetInfo(&free_mem, &total_mem);
-    fprintf(stdout, "Free memory: %zu bytes, Total memory: %zu bytes\n", free_mem, total_mem);
-    err = cudaMalloc((void **) &d_transactions, n * transaction_size);
-    if (err != cudaSuccess) {
-        fprintf(stderr, "Error allocating device memory for transactions: %s\n", cudaGetErrorString(err));
-        return;
-    }
-    else {
-        fprintf(stderr, "Device memory for transactions allocated successfully.\n");
-    }
+    cudaMalloc((void **) &d_transactions, n * transaction_size);
     cudaMemcpy(d_transactions, transactions, n * transaction_size, cudaMemcpyHostToDevice);
     
     // Device memory for current level hashes
@@ -215,11 +185,7 @@ void construct_merkle_root(int transaction_size, BYTE *transactions, int max_tra
     while (current_level_size > 1) {
         int next_level_size = (current_level_size + 1) / 2;
         BYTE *d_next_hashes;
-        err = cudaMalloc(&d_next_hashes, next_level_size * SHA256_HASH_SIZE);
-        if (err != cudaSuccess) {
-            fprintf(stderr, "Error allocating device memory for next level hashes: %s\n", cudaGetErrorString(err));
-            return;
-        }
+        cudaMalloc(&d_next_hashes, next_level_size * SHA256_HASH_SIZE);
         // Compute the needed number of blocks
         int no_of_blocks = (current_level_size / threadsPerBlock);
         if (current_level_size % threadsPerBlock != 0) {
@@ -234,11 +200,7 @@ void construct_merkle_root(int transaction_size, BYTE *transactions, int max_tra
 
         cudaFree(d_current_hashes);
         // Allocate memory for the current level hashes
-        err = cudaMalloc((void **)&d_current_hashes, next_level_size * SHA256_HASH_SIZE);
-        if (err != cudaSuccess) {
-            fprintf(stderr, "Error allocating device memory for current level hashes: %s\n", cudaGetErrorString(err));
-            return;
-        }
+        cudaMalloc((void **)&d_current_hashes, next_level_size * SHA256_HASH_SIZE);
         // Copy the next level hashes to the current level
         cudaMemcpy(d_current_hashes, d_next_hashes, next_level_size * SHA256_HASH_SIZE, cudaMemcpyDeviceToDevice);
         cudaFree(d_next_hashes);
@@ -248,60 +210,8 @@ void construct_merkle_root(int transaction_size, BYTE *transactions, int max_tra
     // Copy the final Merkle root to the host
     cudaMemcpy(merkle_root, d_current_hashes, SHA256_HASH_SIZE, cudaMemcpyDeviceToHost);
     cudaFree(d_current_hashes);
-
-    printf("Merkle root computed successfully.\n");
-    printf("Merkle root: %s\n", merkle_root);
-
 }
 
-// Kernel for finding a valid nonce (proof of work)
-__global__ void find_nonce_kernel(BYTE *difficulty, uint32_t max_nonce, BYTE *block_content, 
-                                 size_t content_length, uint32_t *valid_nonce, 
-                                 int *found_flag, BYTE *result_hash) {
-    
-    // Each thread handles a range of nonces based on thread ID and stride
-    uint32_t thread_id = blockIdx.x * blockDim.x + threadIdx.x;
-    uint32_t stride = blockDim.x * gridDim.x;
-    
-    // Local memory for each thread
-    char nonce_str[NONCE_SIZE];
-    BYTE local_block[BLOCK_SIZE];
-    BYTE hash[SHA256_HASH_SIZE];
-    
-    // Copy block content to local memory
-    for (int i = 0; i < content_length; i++) {
-        local_block[i] = block_content[i];
-    }
-    local_block[content_length] = '\0';
-    
-    // Try nonces assigned to this thread
-    for (uint32_t nonce = thread_id; nonce < max_nonce && *found_flag == 0; nonce += stride) {
-        // Convert nonce to string and append to block
-        int len = intToString(nonce, nonce_str);
-        
-        // Append nonce to block content
-        for (int i = 0; i <= len; i++) {
-            local_block[content_length + i] = nonce_str[i];
-        }
-        
-        // Compute hash
-        apply_sha256(local_block, hash);
-        
-        // Check if hash meets difficulty target
-        if (compare_hashes(hash, difficulty) <= 0) {
-            // Use atomic operation to ensure only one thread succeeds
-            if (atomicCAS(found_flag, 0, 1) == 0) {
-                *valid_nonce = nonce;
-                
-                // Copy the hash to result
-                for (int i = 0; i < SHA256_HASH_SIZE; i++) {
-                    result_hash[i] = hash[i];
-                }
-            }
-            return;
-        }
-    }
-}
 
 // CUDA implementation for finding a valid nonce
 int find_nonce(BYTE *difficulty, uint32_t max_nonce, BYTE *block_content, size_t current_length, BYTE *block_hash, uint32_t *valid_nonce) {
@@ -321,12 +231,14 @@ int find_nonce(BYTE *difficulty, uint32_t max_nonce, BYTE *block_content, size_t
     return 1;
 }
 
+
+__global__ void dummy_kernel() {}
+
 // Warm-up function for the GPU
 void warm_up_gpu() {
-    cudaFree(0);  // Simple CUDA call to initialize the CUDA context
-    
-    // Allocate and free a small amount of memory to ensure the GPU is ready
-    BYTE *dummy;
-    cudaMalloc(&dummy, 256);
-    cudaFree(dummy);
+    BYTE *dummy_data;
+    cudaMalloc((void **)&dummy_data, 256);
+    dummy_kernel<<<1, 1>>>();
+    cudaDeviceSynchronize();
+    cudaFree(dummy_data);
 }

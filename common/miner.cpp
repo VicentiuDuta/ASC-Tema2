@@ -68,7 +68,7 @@ void read_transactions(int transaction_size, BYTE *transactions, int max_transac
     }
 }
 
-void print_mining_results(const char *input_file_name, int block_number, uint32_t nonce, BYTE *block_hash, BYTE *merkle_root, double merkle_root_time, double find_nonce_time, double total_block_time, int nonce_found) {
+void print_mining_results(const char *input_file_name, int block_number, uint32_t nonce, BYTE *block_hash, double merkle_root_time, double find_nonce_time, double total_block_time, int nonce_found) {
     char output_file_path[256];
     snprintf(output_file_path, sizeof(output_file_path), "output/%s.out", input_file_name);
 
@@ -80,7 +80,7 @@ void print_mining_results(const char *input_file_name, int block_number, uint32_
     }
 
     if (nonce_found) {
-        fprintf(output_file, "%d,%u,%s,%s,%.5f,%.5f,%.5f\n", block_number + 1, nonce, block_hash, merkle_root, merkle_root_time, find_nonce_time, total_block_time);
+        fprintf(output_file, "%d,%u,%s,%.5f,%.5f,%.5f\n", block_number + 1, nonce, block_hash, merkle_root_time, find_nonce_time, total_block_time);
     } else {
         fprintf(output_file, "%d,No valid nonce found\n", block_number + 1);
     }
@@ -153,7 +153,7 @@ void generate_blockchain(const char *input_file_name) {
         total_time += total_block_time;
 
         // Print results
-        print_mining_results(input_file_name, block_number, nonce, block_hash, merkle_root, merkle_root_time, find_nonce_time, total_block_time, nonce_found);
+        print_mining_results(input_file_name, block_number, nonce, block_hash, merkle_root_time, find_nonce_time, total_block_time, nonce_found);
 
         if (!nonce_found) break;
 

@@ -162,22 +162,141 @@ void construct_merkle_root(int transaction_size, BYTE *transactions, int max_tra
 }
 
 
-// CUDA implementation for finding a valid nonce
-int find_nonce(BYTE *difficulty, uint32_t max_nonce, BYTE *block_content, size_t current_length, BYTE *block_hash, uint32_t *valid_nonce) {
-    char nonce_string[NONCE_SIZE];
 
-    for (uint32_t nonce = 0; nonce <= max_nonce; nonce++) {
-        sprintf(nonce_string, "%u", nonce);
-        strcpy((char *)block_content + current_length, nonce_string);
-        apply_sha256(block_content, block_hash);
+// Specialized kernel for nonce search - designed for maximum throughput
+__global__ void find_nonce_kernel(BYTE *difficulty, uint32_t max_nonce, BYTE *block_content, 
+    size_t current_length, BYTE *block_hash, 
+    uint32_t *valid_nonce, int *found_flag) {
+    // Thread identifiers
+    uint32_t tid = threadIdx.x;
+    uint32_t global_id = blockIdx.x * blockDim.x + tid;
+    uint32_t total_threads = blockDim.x * gridDim.x;
 
-        if (compare_hashes(block_hash, difficulty) <= 0) {
-            *valid_nonce = nonce;
-            return 0;
-        }
+    // Load difficulty pattern into shared memory for faster access
+    __shared__ BYTE shared_difficulty[SHA256_HASH_SIZE];
+    if (tid < SHA256_HASH_SIZE) {
+    shared_difficulty[tid] = difficulty[tid];
+    }
+    __syncthreads();
+
+    // Prepare local copy of block content
+    BYTE local_block[BLOCK_SIZE];
+    for (size_t i = 0; i < current_length; i++) {
+    local_block[i] = block_content[i];
+    }
+    local_block[current_length] = '\0';
+
+    // Process nonces with efficient striping
+    for (uint32_t nonce = global_id; nonce <= max_nonce && !(*found_flag); nonce += total_threads) {
+    // Format nonce as string
+    char nonce_str[NONCE_SIZE];
+    int len = intToString(nonce, nonce_str);
+
+    // Append nonce to block content
+    d_strcpy((char*)(local_block + current_length), nonce_str);
+
+    // Calculate hash
+    BYTE hash[SHA256_HASH_SIZE];
+    apply_sha256(local_block, hash);
+
+    // Quick check for first few characters (most will fail here)
+    if (hash[0] <= shared_difficulty[0]) {
+    // If first character matches, do a more thorough check
+    bool is_valid = true;
+
+    // Direct character comparison for speed - unrolled loop
+    if (hash[0] == shared_difficulty[0]) {
+    #pragma unroll 4
+    for (int i = 1; i < 5; i++) {
+    if (hash[i] > shared_difficulty[i]) {
+    is_valid = false;
+    break;
+    } 
+    else if (hash[i] < shared_difficulty[i]) {
+    break; // Hash is definitely smaller
+    }
     }
 
-    return 1;
+    // Only do a full comparison if the first 5 chars indicate a match
+    if (is_valid && compare_hashes(hash, shared_difficulty) > 0) {
+    is_valid = false;
+    }
+    }
+
+    // If we found a valid hash
+    if (is_valid) {
+    // Atomically check and set the found flag
+    if (atomicCAS(found_flag, 0, 1) == 0) {
+    // We're the first to find a solution
+    *valid_nonce = nonce;
+
+    // Copy the hash result
+    for (int i = 0; i < SHA256_HASH_SIZE; i++) {
+    block_hash[i] = hash[i];
+    }
+    }
+    return; // Exit immediately
+}
+}
+}
+}
+
+// Host function to find a valid nonce
+int find_nonce(BYTE *difficulty, uint32_t max_nonce, BYTE *block_content,  size_t current_length, BYTE *block_hash, uint32_t *valid_nonce) {
+    // Device memory pointers
+    BYTE *d_difficulty, *d_block_content, *d_block_hash;
+    uint32_t *d_valid_nonce;
+    int *d_found_flag;
+
+    // Allocate device memory
+    cudaMalloc(&d_difficulty, SHA256_HASH_SIZE);
+    cudaMalloc(&d_block_content, current_length + NONCE_SIZE);
+    cudaMalloc(&d_block_hash, SHA256_HASH_SIZE);
+    cudaMalloc(&d_valid_nonce, sizeof(uint32_t));
+    cudaMalloc(&d_found_flag, sizeof(int));
+
+    // Copy input data to device
+    cudaMemcpy(d_difficulty, difficulty, SHA256_HASH_SIZE, cudaMemcpyHostToDevice);
+    cudaMemcpy(d_block_content, block_content, current_length, cudaMemcpyHostToDevice);
+    cudaMemset(d_found_flag, 0, sizeof(int));
+
+    // Query device properties for optimal launch configuration
+    cudaDeviceProp props;
+    cudaGetDeviceProperties(&props, 0);
+
+    // Determine optimal launch configuration based on GPU
+    const int threadsPerBlock = 256;
+    const int maxBlocksPerSM = 48; // Tesla K40m has 15 SMs, each can handle up to 16 blocks
+    const int numBlocks = props.multiProcessorCount * maxBlocksPerSM;
+
+    // Launch kernel
+    find_nonce_kernel<<<numBlocks, threadsPerBlock>>>(
+        d_difficulty, max_nonce, d_block_content, current_length,
+        d_block_hash, d_valid_nonce, d_found_flag
+    );
+
+    // Wait for completion
+    cudaDeviceSynchronize();
+
+    // Check if a valid nonce was found
+    int found = 0;
+    cudaMemcpy(&found, d_found_flag, sizeof(int), cudaMemcpyDeviceToHost);
+
+    if (found) {
+        // Copy results back to host
+        cudaMemcpy(valid_nonce, d_valid_nonce, sizeof(uint32_t), cudaMemcpyDeviceToHost);
+        cudaMemcpy(block_hash, d_block_hash, SHA256_HASH_SIZE, cudaMemcpyDeviceToHost);
+    }
+
+    // Clean up device memory
+    cudaFree(d_difficulty);
+    cudaFree(d_block_content);
+    cudaFree(d_block_hash);
+    cudaFree(d_valid_nonce);
+    cudaFree(d_found_flag);
+
+    // Return 0 if a valid nonce was found, 1 otherwise
+    return found ? 0 : 1;
 }
 
 __global__ void dummy_kernel() {}
